@@ -19,6 +19,9 @@ extension PlayerCapabilities {
     if pause != false {
       commands.append(.pause)
     }
+    if play != false || pause != false {
+      commands.append(.togglePlayPause)
+    }
     if stop != false {
       commands.append(.stop)
     }
