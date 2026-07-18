@@ -28,8 +28,11 @@ import com.audiobrowser.util.CoilBitmapLoader
 import com.margelo.nitro.audiobrowser.AppKilledPlaybackBehavior
 import com.margelo.nitro.audiobrowser.SearchMode
 import com.margelo.nitro.audiobrowser.SearchParams
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import timber.log.Timber
 
@@ -43,11 +46,29 @@ import timber.log.Timber
  */
 @MainThread
 class Service : MediaLibraryService(), MediaSessionService.Listener {
+  companion object {
+    /**
+     * How long to wait, after [onGetSession] falls back to a bare/empty player setup for a
+     * non-JS-driven external controller (e.g. a MediaButtonReceiver revival from Bluetooth/AVRCP
+     * or Android Auto after the app was fully killed), before rechecking whether anything
+     * legitimate followed up. Re-checked on a loop (not just once) as long as an external
+     * controller stays connected, so a long-lived Android Auto browsing session is never torn
+     * down just because it hasn't started playback yet.
+     *
+     * 10s comfortably exceeds the time a real external controller's connection handshake and
+     * first command dispatch take (typically sub-second), while bounding how long a genuinely
+     * phantom, contentless "<App> is running" notification can linger before cleanup.
+     */
+    private const val GHOST_SESSION_GRACE_PERIOD_MS = 10_000L
+  }
+
   lateinit var player: Player
   private val binder = LocalBinder()
   private val scope = MainScope()
   private lateinit var mediaSession: MediaLibrarySession
   private lateinit var imageLoader: ImageLoader
+  private var ghostSessionWatchdog: Job? = null
+  private var isTearingDownPhantomSession = false
 
   // Callback for battery warning events to notify JS layer
   var onBatteryWarningPendingChanged: ((Boolean) -> Unit)? = null
@@ -287,13 +308,93 @@ class Service : MediaLibraryService(), MediaSessionService.Listener {
 
     // Ensure player is properly set up for external controllers like Android Auto
     // Only call setup if callbacks haven't been installed yet (meaning React Native hasn't
-    // connected)
-    if (player.getCallbacks() == null) {
+    // connected). Skip if we're already mid-teardown of a previous phantom session (stopSelf()
+    // is async - another controller could still probe onGetSession in that window).
+    if (player.getCallbacks() == null && !isTearingDownPhantomSession) {
       Timber.w("External controller connecting before React Native setup - using default options")
       player.setup(PlayerSetupOptions())
+      scheduleGhostSessionWatchdog()
     }
 
     return mediaSession
+  }
+
+  /**
+   * Schedules a recheck of whether the bare/empty player setup created in [onGetSession] ever
+   * got legitimate follow-up: React Native attaching (`player.getCallbacks() != null`), real
+   * media getting loaded (`!player.isEmpty`), or a real external controller staying connected
+   * (e.g. Android Auto browsing). If none of those hold after the grace period, tears the
+   * phantom session down using the same sequence already proven in the [onTaskRemoved]
+   * shutdown path, so the contentless "<App> is running" foreground notification doesn't
+   * linger forever.
+   *
+   * Guarded by [ghostSessionWatchdog]'s active state so repeated onGetSession calls before the
+   * first check runs (e.g. multiple external controllers probing the still-unattached session)
+   * don't stack multiple timers.
+   */
+  private fun scheduleGhostSessionWatchdog() {
+    if (ghostSessionWatchdog?.isActive == true) {
+      return
+    }
+
+    ghostSessionWatchdog = scope.launch {
+      while (isActive) {
+        delay(GHOST_SESSION_GRACE_PERIOD_MS)
+
+        if (player.getCallbacks() != null) {
+          Timber.d("Ghost session watchdog: React Native attached - standing down")
+          return@launch
+        }
+
+        if (!player.isEmpty) {
+          Timber.d("Ghost session watchdog: real media loaded - standing down")
+          return@launch
+        }
+
+        // Same "is a real external controller still around" check used in onTaskRemoved.
+        val hasExternalControllers =
+          mediaSession.connectedControllers.any { controller ->
+            controller.packageName != packageName && // Not our own app
+              controller.packageName != "com.android.systemui" // Not system UI
+          }
+
+        if (hasExternalControllers) {
+          Timber.d(
+            "Ghost session watchdog: external controller still connected - rechecking later"
+          )
+          continue
+        }
+
+        Timber.w(
+          "Ghost session watchdog: no legitimate follow-up after bare setup - tearing down " +
+            "phantom session"
+        )
+        tearDownPhantomSession()
+        return@launch
+      }
+    }
+  }
+
+  /**
+   * Tears down a phantom/ghost session created by [onGetSession]'s bare-setup fallback. Mirrors
+   * the [onTaskRemoved] STOP_PLAYBACK_AND_REMOVE_NOTIFICATION-with-no-external-controllers
+   * branch, since it's the same "nothing is legitimately using this service" situation.
+   */
+  private fun tearDownPhantomSession() {
+    isTearingDownPhantomSession = true
+    try {
+      if (::mediaSession.isInitialized) {
+        mediaSession.release()
+      }
+      player.clear()
+      player.stop()
+      player.destroy()
+      stopForeground(STOP_FOREGROUND_REMOVE)
+      stopSelf()
+    } catch (e: Exception) {
+      Timber.e(e, "Error tearing down phantom session")
+      stopSelf()
+    }
   }
 
   override fun onUnbind(intent: Intent?): Boolean {
@@ -315,6 +416,11 @@ class Service : MediaLibraryService(), MediaSessionService.Listener {
 
   override fun onDestroy() {
     Timber.d("onDestroy called")
+
+    // Cancel any pending ghost-session watchdog so it can't fire against an already
+    // torn-down mediaSession/player if the service is destroyed through another path
+    // (e.g. onTaskRemoved's own teardown, or the system reclaiming the service).
+    ghostSessionWatchdog?.cancel()
 
     // Unbind from HeadlessTaskService to avoid ServiceConnection leak
     unbindService(headlessConnection)
