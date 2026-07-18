@@ -49,10 +49,15 @@ final class LoadSeekCoordinator {
     state = .seekInFlight(time: time)
 
     let cmTime = CMTime(seconds: time, preferredTimescale: 1000)
+    // The AVPlayer seek completion handler is `@Sendable` and `delegate` is a
+    // `@MainActor`-isolated reference, so capturing it directly trips Swift 6's
+    // strict sendability checks. We hop straight back to the main actor before
+    // touching it, so the unsafe capture is sound.
+    nonisolated(unsafe) let capturedDelegate = delegate
     player
       .seek(to: cmTime, toleranceBefore: CMTime.zero, toleranceAfter: CMTime.zero) { finished in
         Task { @MainActor in
-          delegate?.handleSeekCompleted(to: time, didFinish: finished)
+          capturedDelegate?.handleSeekCompleted(to: time, didFinish: finished)
         }
       }
 
