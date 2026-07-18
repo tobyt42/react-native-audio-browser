@@ -381,7 +381,9 @@ public final class RNABCarPlayController: NSObject {
   private func configureAssistantCell(on template: CPListTemplate, from resolvedTrack: ResolvedTrack) {
     guard #available(iOS 15.4, *) else { return }
     guard let position = resolvedTrack.carPlaySiriListButton else {
-      template.assistantCellConfiguration = nil
+      if template.assistantCellConfiguration != nil {
+        template.assistantCellConfiguration = nil
+      }
       return
     }
     let cellPosition: CPListItem.AssistantCellPosition = position == .top ? .top : .bottom
